@@ -67,6 +67,8 @@ import org.w3c.dom.TypeInfo;
 import org.xml.sax.SAXException;
 
 /**
+ * A DOM element in an HTML or XML document.
+ *
  * @author Ahmed Ashour
  * @author Marc Guillemot
  * @author Tom Anderson
@@ -360,7 +362,7 @@ public class DomElement extends DomNamespaceNode implements Element {
 
         if (hasChildren) {
             printWriter.print(">");
-            final boolean tag = printChildrenAsXml(indent, true, printWriter);
+            final boolean tag = printChildrenAsXml(indent, false, printWriter);
             if (tag) {
                 printWriter.print("\r\n");
                 printWriter.print(indent);
@@ -378,7 +380,7 @@ public class DomElement extends DomNamespaceNode implements Element {
             printWriter.print("/>");
         }
 
-        return true;
+        return false;
     }
 
     /**
