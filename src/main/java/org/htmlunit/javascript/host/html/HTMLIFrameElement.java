@@ -20,12 +20,15 @@ import org.htmlunit.html.BaseFrameElement;
 import org.htmlunit.html.FrameWindow;
 import org.htmlunit.html.FrameWindow.PageDenied;
 import org.htmlunit.html.HtmlInlineFrame;
+import org.htmlunit.html.HtmlPage;
+import org.htmlunit.javascript.JavaScriptEngine;
 import org.htmlunit.javascript.configuration.JsxClass;
 import org.htmlunit.javascript.configuration.JsxConstructor;
 import org.htmlunit.javascript.configuration.JsxGetter;
 import org.htmlunit.javascript.configuration.JsxSetter;
 import org.htmlunit.javascript.host.Window;
 import org.htmlunit.javascript.host.WindowProxy;
+import org.htmlunit.javascript.host.dom.DOMTokenList;
 import org.htmlunit.javascript.host.event.Event;
 
 /**
@@ -73,6 +76,43 @@ public class HTMLIFrameElement extends HTMLElement {
     }
 
     /**
+     * Returns the token list of the {@code sandbox} attribute.
+     * @return the token list of the {@code sandbox} attribute
+     */
+    @JsxGetter
+    public DOMTokenList getSandbox() {
+        return new DOMTokenList(this, BaseFrameElement.SANDBOX_ATTRIBUTE);
+    }
+
+    /**
+     * Sets the value of the {@code sandbox} attribute; this does not affect the current document.
+     * @param sandbox the new value
+     */
+    @JsxSetter
+    public void setSandbox(final Object sandbox) {
+        getDomNodeOrDie().setAttribute(BaseFrameElement.SANDBOX_ATTRIBUTE, JavaScriptEngine.toString(sandbox));
+    }
+
+    /**
+     * Returns the value of the {@code srcdoc} attribute.
+     * @return the value of the {@code srcdoc} attribute
+     */
+    @JsxGetter
+    public String getSrcdoc() {
+        return getDomNodeOrDie().getAttribute(BaseFrameElement.SRCDOC_ATTRIBUTE);
+    }
+
+    /**
+     * Sets the value of the {@code srcdoc} attribute; this loads the content.
+     * @param srcdoc the new value
+     */
+    @JsxSetter
+    public void setSrcdoc(final String srcdoc) {
+        getDomNodeOrDie().setAttribute(BaseFrameElement.SRCDOC_ATTRIBUTE, srcdoc);
+        isAttachedToPageDuringOnload_ = false;
+    }
+
+    /**
      * Returns the document the frame contains, if any.
      * @return {@code null} if no document is contained
      * @see <a href="http://www.mozilla.org/docs/dom/domref/dom_frame_ref4.html">Gecko DOM Reference</a>
@@ -81,6 +121,11 @@ public class HTMLIFrameElement extends HTMLElement {
     public DocumentProxy getContentDocument() {
         final FrameWindow frameWindow = getFrame().getEnclosedWindow();
         if (PageDenied.NONE != frameWindow.getPageDenied()) {
+            return null;
+        }
+        // the document of a sandboxed frame without 'allow-same-origin' has an opaque
+        // origin; the parent has no access
+        if (frameWindow.getEnclosedPage() instanceof HtmlPage framePage && framePage.isOpaqueOrigin()) {
             return null;
         }
         return ((Window) frameWindow.getScriptableObject()).getDocument_js();

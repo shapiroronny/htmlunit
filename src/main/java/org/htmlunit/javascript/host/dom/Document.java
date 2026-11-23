@@ -42,6 +42,7 @@ import org.htmlunit.HttpHeader;
 import org.htmlunit.Page;
 import org.htmlunit.SgmlPage;
 import org.htmlunit.StringWebResponse;
+import org.htmlunit.WebClient;
 import org.htmlunit.WebResponse;
 import org.htmlunit.WebWindow;
 import org.htmlunit.corejs.javascript.Callable;
@@ -1133,12 +1134,23 @@ public class Document extends Node {
     @JsxGetter
     public String getCookie() {
         final SgmlPage sgmlPage = getPage();
+        checkCookieAccess(sgmlPage);
 
         final StringBuilder builder = new StringBuilder();
-        final Set<Cookie> cookies = sgmlPage.getWebClient().getCookies(getCookieUrl(sgmlPage));
+        final URL cookieUrl = getCookieUrl(sgmlPage);
+        if (isCookieAverse(sgmlPage, cookieUrl)) {
+            return "";
+        }
+        final boolean crossSite = isCrossSiteContext(sgmlPage, cookieUrl);
+        final Set<Cookie> cookies = sgmlPage.getWebClient().getCookies(cookieUrl);
         final List<Cookie> visibleCookies = new ArrayList<>();
         for (final Cookie cookie : cookies) {
             if (cookie.isHttpOnly()) {
+                continue;
+            }
+            // a document in a cross-site context (e.g. a cross-site iframe)
+            // sees only the 'SameSite=None' cookies
+            if (crossSite && !"none".equalsIgnoreCase(cookie.getSameSite())) {
                 continue;
             }
             visibleCookies.add(cookie);
@@ -1174,12 +1186,67 @@ public class Document extends Node {
      */
     @JsxSetter
     public void setCookie(final String newCookie) {
+        checkCookieAccess(getPage());
         if (StringUtils.isBlank(newCookie)) {
             return;
         }
 
         final SgmlPage sgmlPage = getPage();
-        sgmlPage.getWebClient().addCookie(newCookie, getCookieUrl(sgmlPage), this);
+        final URL cookieUrl = getCookieUrl(sgmlPage);
+        if (isCookieAverse(sgmlPage, cookieUrl)) {
+            return;
+        }
+        // a document in a cross-site context (e.g. a cross-site iframe)
+        // can set only 'SameSite=None' cookies
+        sgmlPage.getWebClient().addCookie(newCookie, cookieUrl, this, isCrossSiteContext(sgmlPage, cookieUrl));
+    }
+
+    /**
+     * Returns whether the document is cookie-averse: reading the cookies returns an empty string,
+     * writing is ignored. Like the browsers, this is the case for documents without browsing context
+     * (e.g. created by DOMImplementation.createHTMLDocument(), DOMImplementation.createDocument() or
+     * DOMParser) and for documents whose url has no host (e.g. about:blank without creator);
+     * file urls are supported by HtmlUnit (see HtmlUnitBrowserCompatCookieSpec#LOCAL_FILESYSTEM_DOMAIN).
+     *
+     * @param sgmlPage the page of this document
+     * @param cookieUrl the url used for the cookies
+     * @return whether the document is cookie-averse
+     * @see <a href="https://html.spec.whatwg.org/multipage/dom.html#cookie-averse-document-object">
+     *     HTML Living Standard - cookie-averse Document object</a>
+     */
+    private static boolean isCookieAverse(final SgmlPage sgmlPage, final URL cookieUrl) {
+        return sgmlPage.getEnclosingWindow() == null
+                || cookieUrl == null
+                || (StringUtils.isEmptyOrNull(cookieUrl.getHost()) && !"file".equals(cookieUrl.getProtocol()));
+    }
+
+    /**
+     * Like the browsers, a document with an opaque origin (a sandboxed document without
+     * 'allow-same-origin') has no access to the cookies.
+     *
+     * @param sgmlPage the page of this document
+     */
+    private void checkCookieAccess(final SgmlPage sgmlPage) {
+        if (sgmlPage instanceof HtmlPage htmlPage && htmlPage.isOpaqueOrigin()) {
+            throw JavaScriptEngine.asJavaScriptException(this,
+                    "The document is sandboxed and lacks the 'allow-same-origin' flag.",
+                    org.htmlunit.javascript.host.dom.DOMException.SECURITY_ERR);
+        }
+    }
+
+    /**
+     * Returns whether the document is in a cross-site context: its 'site for cookies' (the top-level
+     * document, if all ancestors are same-site) is not same-site with the url used for the cookies.
+     * Like the browsers, such a document (e.g. a cross-site iframe) has access to the 'SameSite=None'
+     * cookies only.
+     *
+     * @param sgmlPage the page of this document
+     * @param cookieUrl the url used for the cookies
+     * @return whether the document is in a cross-site context
+     */
+    private static boolean isCrossSiteContext(final SgmlPage sgmlPage, final URL cookieUrl) {
+        return sgmlPage instanceof HtmlPage htmlPage
+                && !WebClient.isSameSite(htmlPage.getSiteForCookiesUrl(), cookieUrl);
     }
 
     /**
@@ -1270,7 +1337,8 @@ public class Document extends Node {
             final boolean filterFunctionOnly) {
         org.w3c.dom.traversal.NodeFilter filterWrapper = null;
         if (filter != null) {
-            filterWrapper = n -> {
+            // serializable, the wrapper is part of the iterator/walker state of the page
+            filterWrapper = (org.w3c.dom.traversal.NodeFilter & Serializable) n -> {
                 final Object[] args = {((DomNode) n).getScriptableObject()};
                 final Object response;
                 if (filter instanceof Callable callable) {
@@ -1356,9 +1424,13 @@ public class Document extends Node {
      */
     @JsxGetter
     public String getDomain() {
+        // a document with an opaque origin (sandboxed) has no domain
+        if (getPage() instanceof HtmlPage htmlPage && htmlPage.isOpaqueOrigin()) {
+            return "";
+        }
         if (domain_ == null && getPage().getWebResponse() != null) {
             URL url = getPage().getUrl();
-            if (url == UrlUtils.URL_ABOUT_BLANK) {
+            if (url == UrlUtils.URL_ABOUT_BLANK || UrlUtils.ABOUT_SRCDOC.equals(url.toExternalForm())) {
                 final WebWindow w = getWindow().getWebWindow();
                 if (w instanceof FrameWindow window) {
                     url = window.getEnclosingPage().getUrl();

@@ -103,6 +103,11 @@ public class WebClientOptions implements Serializable {
 
     private boolean isFetchPolyfillEnabled_;
 
+    private boolean htmlFragmentSelfClosingTagsAllowed_;
+    private boolean contentSecurityPolicyReportsEnabled_ = true;
+
+    private boolean localFileAccessFromRemotePagesAllowed_;
+
     /**
      * Sets the SSLContext; if this is set it is used and some other settings are
      * ignored (protocol, keyStore, keyStorePassword, trustStore,
@@ -956,6 +961,29 @@ public class WebClientOptions implements Serializable {
     }
 
     /**
+     * Sets whether the fragment parser of html pages (e.g. {@code setInnerHtml()}) closes a non void element
+     * or iframe written as empty-element tag (e.g. {@code <h3/>}), like up to version 5.5.0. By default the
+     * trailing slash is ignored like in the browsers. A self-closed script is not affected.
+     * Enable this to read back markup written by {@code asXml()} before 5.8.0, which wrote empty elements
+     * like {@code <h3/>}. XHTML pages always honor the trailing slash.
+     *
+     * @param allowed {@code true} to close a non void element written as empty-element tag
+     */
+    public void setHtmlFragmentSelfClosingTagsAllowed(final boolean allowed) {
+        htmlFragmentSelfClosingTagsAllowed_ = allowed;
+    }
+
+    /**
+     * Returns whether the fragment parser of html pages closes a non void element written as empty-element tag.
+     *
+     * @return {@code true} if the fragment parser of html pages closes a non void element written as
+     *         empty-element tag
+     */
+    public boolean isHtmlFragmentSelfClosingTagsAllowed() {
+        return htmlFragmentSelfClosingTagsAllowed_;
+    }
+
+    /**
      * Enables/disables Geolocation support. By default, this property is disabled.
      *
      * @param enabled {@code true} to enable Geolocation support
@@ -1119,5 +1147,57 @@ public class WebClientOptions implements Serializable {
      */
     public boolean isFileProtocolForXMLHttpRequestsAllowed() {
         return fileProtocolForXMLHttpRequestsAllowed_;
+    }
+
+    /**
+     * Enables/disables sending the Content-Security-Policy violation reports to the
+     * uris of the report-uri directive (default {@code true}).
+     * <p>
+     * If disabled, the policies are still enforced, the
+     * {@link org.htmlunit.html.csp.ContentSecurityPolicyViolationListener} is informed and the
+     * securitypolicyviolation event is fired; only the report requests are not sent.
+     * </p>
+     *
+     * @param enabled {@code true} to send the violation reports
+     */
+    public void setContentSecurityPolicyReportsEnabled(final boolean enabled) {
+        contentSecurityPolicyReportsEnabled_ = enabled;
+    }
+
+    /**
+     * Returns whether the Content-Security-Policy violation reports are sent to the
+     * uris of the report-uri directive (default {@code true}).
+     *
+     * @return {@code true} if the violation reports are sent
+     * @see #setContentSecurityPolicyReportsEnabled(boolean)
+     */
+    public boolean isContentSecurityPolicyReportsEnabled() {
+        return contentSecurityPolicyReportsEnabled_;
+    }
+
+    /**
+     * Sets whether pages that were not loaded from a local file are allowed to access
+     * local files (file URLs), default {@code false}.
+     * <p>Like the browsers, HtmlUnit blocks e.g. scripts, images, stylesheets, frames, workers
+     * and navigations to file URLs if the page was not loaded from a file.
+     * Redirects to file URLs are always blocked (Fetch Standard).
+     * Enable this only for tests that depend on the old (insecure) behavior of HtmlUnit;
+     * real browsers will not load these resources.</p>
+     *
+     * @param allowed whether pages not loaded from a file are allowed to access local files
+     */
+    public void setLocalFileAccessFromRemotePagesAllowed(final boolean allowed) {
+        localFileAccessFromRemotePagesAllowed_ = allowed;
+    }
+
+    /**
+     * Returns whether pages that were not loaded from a local file are allowed to access
+     * local files (file URLs), default {@code false}.
+     *
+     * @return {@code true} if pages not loaded from a file are allowed to access local files
+     * @see #setLocalFileAccessFromRemotePagesAllowed(boolean)
+     */
+    public boolean isLocalFileAccessFromRemotePagesAllowed() {
+        return localFileAccessFromRemotePagesAllowed_;
     }
 }

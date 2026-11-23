@@ -16,6 +16,7 @@ package org.htmlunit;
 
 import static java.nio.charset.StandardCharsets.ISO_8859_1;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.htmlunit.BrowserVersionFeatures.DATA_URL_MIME_TYPE_STANDARD_SERIALIZATION;
 
 import java.io.BufferedInputStream;
 import java.io.File;
@@ -511,8 +512,12 @@ public class WebClient implements Serializable, AutoCloseable {
             }
         }
         else {
+            // the document of an iframe with srcdoc attribute is not fetched (the content is the attribute)
+            webResponse = makeWebResponseForSrcdoc(webWindow, webRequest);
             try {
-                webResponse = loadWebResponse(webRequest);
+                if (webResponse == null) {
+                    webResponse = loadWebResponse(webRequest);
+                }
             }
             catch (final NoHttpResponseException e) {
                 webResponse = new WebResponse(RESPONSE_DATA_NO_HTTP_RESPONSE, webRequest, 0);
@@ -893,8 +898,8 @@ public class WebClient implements Serializable, AutoCloseable {
 
     /**
      * Returns the url of the given page used as origin when checking the frame-ancestors
-     * directive of a content security policy. Like in the browsers, an about:blank frame
-     * inherits the origin of its parent.
+     * directive of a content security policy. Like in the browsers, an about:blank (or about:srcdoc)
+     * frame inherits the origin of its parent.
      *
      * @param page the page containing the frame
      * @return the url
@@ -902,7 +907,8 @@ public class WebClient implements Serializable, AutoCloseable {
     private static URL getFrameAncestorUrl(final Page page) {
         Page current = page;
         URL url = current.getUrl();
-        while (UrlUtils.ABOUT_BLANK.equals(url.toExternalForm())
+        while ((UrlUtils.ABOUT_BLANK.equals(url.toExternalForm())
+                    || UrlUtils.ABOUT_SRCDOC.equals(url.toExternalForm()))
                 && current.getEnclosingWindow() instanceof FrameWindow frameWindow) {
             current = frameWindow.getEnclosingPage();
             url = current.getUrl();
@@ -1323,6 +1329,9 @@ public class WebClient implements Serializable, AutoCloseable {
                 final Page openerPage = opener.getEnclosedPage();
                 if (openerPage != null && openerPage.getUrl() != null) {
                     request.setRefererHeader(openerPage.getUrl());
+                    if (openerPage instanceof HtmlPage openerHtmlPage) {
+                        request.setReferrerPolicy(openerHtmlPage.getReferrerPolicy());
+                    }
                 }
                 getPage(window, request);
             }
@@ -1357,7 +1366,7 @@ public class WebClient implements Serializable, AutoCloseable {
             windowToOpen = defaultName;
         }
 
-        WebWindow webWindow = resolveWindow(opener, windowToOpen);
+        WebWindow webWindow = resolveWindow(opener, windowToOpen, true);
 
         if (webWindow == null) {
             if (TARGET_BLANK.equals(windowToOpen)) {
@@ -1373,7 +1382,22 @@ public class WebClient implements Serializable, AutoCloseable {
         return webWindow;
     }
 
-    private WebWindow resolveWindow(final WebWindow opener, final String name) {
+    /**
+     * <span style="color:red">INTERNAL API - SUBJECT TO CHANGE AT ANY TIME - USE AT YOUR OWN RISK.</span><br>
+     *
+     * Returns the existing window for the given target name (e.g. a frame or a window opened before);
+     * the name may be a special target name of _self, _parent or _top (relative to the opener window).
+     * Unlike {@link #openTargetWindow(WebWindow, String, String)} no new window is created.
+     *
+     * @param opener the web window that is looking for the target
+     * @param name the target name
+     * @return the window or {@code null} if there is no window with this name
+     */
+    public WebWindow findTargetWindow(final WebWindow opener, final String name) {
+        return resolveWindow(opener, name, false);
+    }
+
+    private WebWindow resolveWindow(final WebWindow opener, final String name, final boolean loadsContent) {
         if (name == null || name.isEmpty() || TARGET_SELF.equals(name)) {
             return opener;
         }
@@ -1398,7 +1422,7 @@ public class WebClient implements Serializable, AutoCloseable {
                 try {
                     final FrameWindow frame = ((HtmlPage) page).getFrameByName(name);
                     final HtmlUnitScriptable scriptable = frame.getFrameElement().getScriptableObject();
-                    if (scriptable instanceof HTMLIFrameElement element) {
+                    if (loadsContent && scriptable instanceof HTMLIFrameElement element) {
                         element.onRefresh();
                     }
                     return frame;
@@ -1449,6 +1473,7 @@ public class WebClient implements Serializable, AutoCloseable {
 
         if (openerPage != null) {
             request.setRefererHeader(openerPage.getUrl());
+            request.setReferrerPolicy(openerPage.getReferrerPolicy());
         }
 
         getPage(window, request);
@@ -1594,12 +1619,14 @@ public class WebClient implements Serializable, AutoCloseable {
         final DataURLConnection connection = new DataURLConnection(url);
 
         final List<NameValuePair> responseHeaders = new ArrayList<>();
+        final boolean standardSerialization =
+                getBrowserVersion().hasFeature(DATA_URL_MIME_TYPE_STANDARD_SERIALIZATION);
         responseHeaders.add(new NameValuePair(HttpHeader.CONTENT_TYPE_LC,
-            connection.getMediaType() + ";charset=" + connection.getCharset()));
+                connection.getContentType(standardSerialization)));
 
         if (HttpMethod.HEAD.equals(webRequest.getHttpMethod())) {
             final WebResponseData data = new WebResponseData(200, "OK", responseHeaders);
-            return new WebResponse(data, url, webRequest.getHttpMethod(), 0);
+            return new WebResponse(data, webRequest, 0);
         }
 
         try (InputStream is = connection.getInputStream()) {
@@ -1608,8 +1635,28 @@ public class WebClient implements Serializable, AutoCloseable {
                             getOptions().getMaxInMemory(),
                             getOptions().getTempFileDirectory());
             final WebResponseData data = new WebResponseData(downloadedContent, 200, "OK", responseHeaders);
-            return new WebResponse(data, url, webRequest.getHttpMethod(), 0);
+            // the request is used for the default charset (e.g. UTF-8 for XMLHttpRequest)
+            return new WebResponse(data, webRequest, 0);
         }
+    }
+
+    /**
+     * Builds the response for the document of an iframe with srcdoc attribute (about:srcdoc);
+     * the content is the value of the srcdoc attribute.
+     *
+     * @param webWindow the window the response is loaded into
+     * @param webRequest the request
+     * @return the response or {@code null} if the request is not for the srcdoc of a frame
+     */
+    private static WebResponse makeWebResponseForSrcdoc(final WebWindow webWindow, final WebRequest webRequest) {
+        if (webWindow instanceof FrameWindow frameWindow
+                && UrlUtils.ABOUT_SRCDOC.equals(webRequest.getUrl().toExternalForm())) {
+            final String srcdoc = frameWindow.getFrameElement().getAttributeDirect(BaseFrameElement.SRCDOC_ATTRIBUTE);
+            if (DomElement.ATTRIBUTE_NOT_DEFINED != srcdoc) {
+                return new StringWebResponse(srcdoc, UrlUtils.URL_ABOUT_SRCDOC);
+            }
+        }
+        return null;
     }
 
     private static WebResponse makeWebResponseForAboutUrl(final WebRequest webRequest) throws MalformedURLException {
@@ -1793,6 +1840,28 @@ public class WebClient implements Serializable, AutoCloseable {
     }
 
     /**
+     * Sets the {@code Referer} header of the request according to its referrer policy
+     * (if the request has a referrer and a policy).
+     *
+     * @param webRequest the request
+     */
+    private void applyReferrerPolicy(final WebRequest webRequest) {
+        final URL referrer = webRequest.getReferrer();
+        final ReferrerPolicy policy = webRequest.getReferrerPolicy();
+        if (referrer == null || policy == null) {
+            return;
+        }
+
+        final String value = policy.getReferrer(referrer, webRequest.getUrl(), getBrowserVersion());
+        if (value == null) {
+            webRequest.removeAdditionalHeader(HttpHeader.REFERER);
+        }
+        else {
+            webRequest.setAdditionalHeader(HttpHeader.REFERER, value);
+        }
+    }
+
+    /**
      * Loads a {@link WebResponse} from the server through the WebConnection.
      * @param webRequest the request
      * @param allowedRedirects the number of allowed redirects remaining
@@ -1812,6 +1881,7 @@ public class WebClient implements Serializable, AutoCloseable {
 
         url = UrlUtils.encodeUrl(url, webRequest.getCharset());
         webRequest.setUrl(url);
+        applyReferrerPolicy(webRequest);
 
         if (LOG.isDebugEnabled()) {
             LOG.debug("Load response for " + method + " " + url.toExternalForm());
@@ -1862,7 +1932,16 @@ public class WebClient implements Serializable, AutoCloseable {
         addDefaultHeaders(webRequest);
 
         // Retrieve the response, either from the cache or from the server.
-        final WebResponse fromCache = getCache().getCachedResponse(webRequest);
+        final WebRequest.CacheMode cacheMode = webRequest.getCacheMode();
+        addCacheModeHeaders(webRequest, cacheMode);
+        final WebResponse fromCache = cacheMode == WebRequest.CacheMode.NO_STORE
+                                        || cacheMode == WebRequest.CacheMode.RELOAD
+                                    ? null
+                                    : getCache().getCachedResponse(webRequest);
+        if (fromCache == null && cacheMode == WebRequest.CacheMode.ONLY_IF_CACHED) {
+            throw new IOException("No cached response for '" + webRequest.getUrl()
+                    + "' (cache mode 'only-if-cached').");
+        }
         final WebResponse webResponse = getWebResponseOrUseCached(webRequest, fromCache);
 
         // Continue according to the HTTP status code.
@@ -1908,6 +1987,13 @@ public class WebClient implements Serializable, AutoCloseable {
                 newUrl = redirectUrlMapper.apply(newUrl);
             }
 
+            // Fetch standard: a redirect to an url that is not http(s) (e.g. a local file) is a network error
+            final String newProtocol = newUrl.getProtocol();
+            if (!"http".equals(newProtocol) && !"https".equals(newProtocol)) {
+                throw new IOException("Redirect to the non HTTP(S) url '" + newUrl + "' is not allowed ("
+                        + webResponse.getWebRequest().getUrl() + ")");
+            }
+
             final Predicate<URL> redirectFilter = webRequest.getRedirectFilter();
             if (redirectFilter != null && !redirectFilter.test(newUrl)) {
                 if (LOG.isDebugEnabled()) {
@@ -1934,9 +2020,13 @@ public class WebClient implements Serializable, AutoCloseable {
                     // credentials are not forwarded to another origin
                     wrs.removeAdditionalHeader("Authorization");
                 }
+                // the Referer header is determined again for the new url
+                wrs.setRefererHeader(webRequest.getReferrer());
+                wrs.setReferrerPolicy(webRequest.getReferrerPolicy());
                 wrs.setFetchDestination(webRequest.getFetchDestination());
                 wrs.setFetchModeOverride(webRequest.getFetchModeOverride());
                 wrs.setRequestingUrl(webRequest.getRequestingUrl());
+                wrs.setSiteForCookies(webRequest.getSiteForCookies());
                 wrs.setRedirectFilter(redirectFilter);
                 wrs.setRedirectUrlMapper(redirectUrlMapper);
 
@@ -1968,6 +2058,9 @@ public class WebClient implements Serializable, AutoCloseable {
                     // credentials are not forwarded to another origin
                     wrs.removeAdditionalHeader("Authorization");
                 }
+                // the Referer header is determined again for the new url
+                wrs.setRefererHeader(webRequest.getReferrer());
+                wrs.setReferrerPolicy(webRequest.getReferrerPolicy());
                 wrs.setRedirectFilter(redirectFilter);
                 wrs.setRedirectUrlMapper(redirectUrlMapper);
 
@@ -1975,10 +2068,34 @@ public class WebClient implements Serializable, AutoCloseable {
             }
         }
 
-        if (fromCache == null) {
+        if (fromCache == null && cacheMode != WebRequest.CacheMode.NO_STORE) {
             getCache().cacheIfPossible(webRequest, webResponse, null);
         }
         return webResponse;
+    }
+
+    /**
+     * Adds the headers the fetch standard requires for the cache mode
+     * (only if the request does not already have them).
+     *
+     * @param webRequest the request
+     * @param cacheMode the cache mode
+     * @see <a href="https://fetch.spec.whatwg.org/#http-network-or-cache-fetch">Fetch Standard
+     *      - HTTP-network-or-cache fetch</a>
+     */
+    private static void addCacheModeHeaders(final WebRequest webRequest, final WebRequest.CacheMode cacheMode) {
+        if (cacheMode == WebRequest.CacheMode.NO_STORE || cacheMode == WebRequest.CacheMode.RELOAD) {
+            if (webRequest.getAdditionalHeader("Pragma") == null) {
+                webRequest.setAdditionalHeader("Pragma", "no-cache");
+            }
+            if (webRequest.getAdditionalHeader(HttpHeader.CACHE_CONTROL) == null) {
+                webRequest.setAdditionalHeader(HttpHeader.CACHE_CONTROL, "no-cache");
+            }
+        }
+        else if (cacheMode == WebRequest.CacheMode.NO_CACHE
+                && webRequest.getAdditionalHeader(HttpHeader.CACHE_CONTROL) == null) {
+            webRequest.setAdditionalHeader(HttpHeader.CACHE_CONTROL, "max-age=0");
+        }
     }
 
     /**
@@ -1993,7 +2110,9 @@ public class WebClient implements Serializable, AutoCloseable {
             return getWebConnection().getResponse(webRequest);
         }
 
-        if (!HeaderUtils.containsNoCache(cached)) {
+        final WebRequest.CacheMode cacheMode = webRequest.getCacheMode();
+        if (cacheMode == WebRequest.CacheMode.FORCE_CACHE || cacheMode == WebRequest.CacheMode.ONLY_IF_CACHED
+                || cacheMode != WebRequest.CacheMode.NO_CACHE && !HeaderUtils.containsNoCache(cached)) {
             return new WebResponseFromCache(cached, webRequest);
         }
 
@@ -2959,7 +3078,7 @@ public class WebClient implements Serializable, AutoCloseable {
         final WebRequest request, final boolean checkHash,
         final String forceAttachmentWithFilename, final String description) {
 
-        final WebWindow targetWindow = resolveWindow(requestingWindow, target);
+        final WebWindow targetWindow = resolveWindow(requestingWindow, target, true);
         final URL url = request.getUrl();
 
         if (targetWindow != null && HttpMethod.POST != request.getHttpMethod()) {
@@ -3004,9 +3123,11 @@ public class WebClient implements Serializable, AutoCloseable {
 
         final LoadJob loadJob;
         try {
-            WebResponse response;
+            WebResponse response = makeWebResponseForSrcdoc(targetWindow, request);
             try {
-                response = loadWebResponse(request);
+                if (response == null) {
+                    response = loadWebResponse(request);
+                }
                 if (response == null) {
                     // blocked by the redirect filter of the request
                     return;
@@ -3058,7 +3179,7 @@ public class WebClient implements Serializable, AutoCloseable {
                 continue;
             }
 
-            final WebWindow window = resolveWindow(loadJob.requestingWindow_, loadJob.target_);
+            final WebWindow window = resolveWindow(loadJob.requestingWindow_, loadJob.target_, true);
             if (updatedWindows.contains(window)) {
                 if (LOG.isInfoEnabled()) {
                     LOG.info("No usage of download: " + loadJob);
@@ -3152,6 +3273,20 @@ public class WebClient implements Serializable, AutoCloseable {
     }
 
     /**
+     * <span style="color:red">INTERNAL API - SUBJECT TO CHANGE AT ANY TIME - USE AT YOUR OWN RISK.</span><br>
+     *
+     * Same-site comparison per the HTML "same site" algorithm: same scheme and same
+     * registrable domain (eTLD+1, based on the public suffix list), ignoring port and subdomain.
+     *
+     * @param url1 the first url
+     * @param url2 the second url
+     * @return whether both urls are same-site
+     */
+    public static boolean isSameSite(final URL url1, final URL url2) {
+        return HttpClientConverter.isSameSite(url1, url2);
+    }
+
+    /**
      * Parses the given cookie and adds this to our cookie store.
      * The cookie is treated as set by a non-HTTP API (e.g. document.cookie);
      * HttpOnly cookies are ignored and existing HttpOnly cookies are not replaced.
@@ -3160,6 +3295,23 @@ public class WebClient implements Serializable, AutoCloseable {
      * @param origin the requester
      */
     public void addCookie(final String cookieString, final URL pageUrl, final Object origin) {
+        addCookie(cookieString, pageUrl, origin, false);
+    }
+
+    /**
+     * <span style="color:red">INTERNAL API - SUBJECT TO CHANGE AT ANY TIME - USE AT YOUR OWN RISK.</span><br>
+     *
+     * Parses the given cookie and adds this to our cookie store.
+     * The cookie is treated as set by a non-HTTP API (e.g. document.cookie);
+     * HttpOnly cookies are ignored and existing HttpOnly cookies are not replaced.
+     * @param cookieString the string to parse
+     * @param pageUrl the url of the page that likes to set the cookie
+     * @param origin the requester
+     * @param sameSiteNoneOnly if {@code true} only 'SameSite=None' cookies are added; like the browsers,
+     *        a document in a cross-site context (e.g. a cross-site iframe) can set only these cookies
+     */
+    public void addCookie(final String cookieString, final URL pageUrl, final Object origin,
+            final boolean sameSiteNoneOnly) {
         final CookieManager cookieManager = getCookieManager();
         if (!cookieManager.isCookiesEnabled()) {
             if (LOG.isDebugEnabled()) {
@@ -3171,9 +3323,15 @@ public class WebClient implements Serializable, AutoCloseable {
 
         try {
             final List<Cookie> cookies = HttpClientConverter.parseCookie(cookieString, pageUrl, getBrowserVersion());
+            final boolean secureOrigin = HttpClientConverter.isSecureCookieOrigin(
+                                            HttpClientConverter.buildCookieOrigin(pageUrl));
             // final List<Cookie> cookies = CookieParser.parseCookie(cookieString, pageUrl, getBrowserVersion());
 
             for (final Cookie cookie : cookies) {
+                if (sameSiteNoneOnly && !"none".equalsIgnoreCase(cookie.getSameSite())) {
+                    continue;
+                }
+
                 // RFC 6265 5.3 steps 10 and 11: a non-HTTP API must neither
                 // create an HttpOnly cookie nor replace an existing one
                 if (cookie.isHttpOnly()) {
@@ -3187,6 +3345,12 @@ public class WebClient implements Serializable, AutoCloseable {
                     }
                 }
                 if (replacesHttpOnly) {
+                    continue;
+                }
+
+                // RFC 6265bis 5.7 step 16: an insecure origin must not overwrite (or shadow) a secure cookie
+                if (!secureOrigin && !cookie.isSecure()
+                        && HttpClientConverter.shadowsSecureCookie(cookie, cookieManager.getCookies())) {
                     continue;
                 }
 

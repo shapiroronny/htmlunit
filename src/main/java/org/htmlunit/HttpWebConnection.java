@@ -30,6 +30,7 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -56,6 +57,7 @@ import org.apache.http.HttpHost;
 import org.apache.http.HttpRequest;
 import org.apache.http.HttpRequestInterceptor;
 import org.apache.http.HttpResponse;
+import org.apache.http.HttpResponseInterceptor;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.Credentials;
 import org.apache.http.client.AuthCache;
@@ -109,6 +111,7 @@ import org.htmlunit.WebRequest.HttpHint;
 import org.htmlunit.http.HttpUtils;
 import org.htmlunit.httpclient.HtmlUnitCookieSpecProvider;
 import org.htmlunit.httpclient.HtmlUnitCookieStore;
+import org.htmlunit.httpclient.HtmlUnitInsecureOriginCookieStore;
 import org.htmlunit.httpclient.HtmlUnitSameSiteCookieStore;
 import org.htmlunit.httpclient.HtmlUnitRedirectStrategie;
 import org.htmlunit.httpclient.HtmlUnitSSLConnectionSocketFactory;
@@ -672,7 +675,12 @@ public class HttpWebConnection implements WebConnection {
         b.add(new RequestAuthCache());
 
         if (!webRequest.hasHint(HttpHint.BlockCookies)) {
-            b.add(new ResponseProcessCookies());
+            if (HttpClientConverter.isSecureCookieOrigin(HttpClientConverter.buildCookieOrigin(webRequest.getUrl()))) {
+                b.add(new ResponseProcessCookies());
+            }
+            else {
+                b.add(new InsecureOriginResponseProcessCookies());
+            }
         }
         builder.setHttpProcessor(b.build());
     }
@@ -776,10 +784,14 @@ public class HttpWebConnection implements WebConnection {
                 while ((nbRead = is.read(buffer)) != -1) {
                     bos.write(buffer, 0, nbRead);
                     if (maxInMemory > 0 && bos.size() > maxInMemory) {
-                        // we have exceeded the max for memory, let's write everything to a temporary file
-                        final File file = File.createTempFile("htmlunit", ".tmp", tempFileDirectory);
+                        // we have exceeded the max for memory, let's write everything to a temporary file;
+                        // Files.createTempFile() restricts the access to the owner of the file
+                        final Path path = tempFileDirectory == null
+                                ? Files.createTempFile("htmlunit", ".tmp")
+                                : Files.createTempFile(tempFileDirectory.toPath(), "htmlunit", ".tmp");
+                        final File file = path.toFile();
                         file.deleteOnExit();
-                        try (OutputStream fos = Files.newOutputStream(file.toPath())) {
+                        try (OutputStream fos = Files.newOutputStream(path)) {
                             bos.writeTo(fos); // what we have already read
                             IOUtils.copyLarge(is, fos); // what remains from the server response
                         }
@@ -884,7 +896,7 @@ public class HttpWebConnection implements WebConnection {
         if (isSameOrigin(requestingUrl, targetUrl)) {
             return "same-origin";
         }
-        if (isSameSite(requestingUrl, targetUrl)) {
+        if (HttpClientConverter.isSameSite(requestingUrl, targetUrl)) {
             return "same-site";
         }
         return "cross-site";
@@ -899,26 +911,6 @@ public class HttpWebConnection implements WebConnection {
     private static int effectivePort(final URL url) {
         final int port = url.getPort();
         return port == -1 ? url.getDefaultPort() : port;
-    }
-
-    /**
-     * Same-site comparison per the Fetch Metadata / HTML "same site" algorithm: same
-     * scheme and same registrable domain (eTLD+1), ignoring port and subdomain.
-     *
-     * @param a first URL
-     * @param b second URL
-     * @return whether both URLs are considered "same-site"
-     */
-    private static boolean isSameSite(final URL a, final URL b) {
-        if (!a.getProtocol().equals(b.getProtocol())) {
-            return false;
-        }
-
-        final String registrableDomainA = HttpClientConverter.registrableDomain(a.getHost());
-        final String registrableDomainB = HttpClientConverter.registrableDomain(b.getHost());
-
-        // both are normalized and in lower case
-        return registrableDomainA.equals(registrableDomainB);
     }
 
     /**
@@ -1136,8 +1128,15 @@ public class HttpWebConnection implements WebConnection {
             }
             else if (HttpHeader.COOKIE.equals(header)) {
                 if (!webRequest.hasHint(HttpHint.BlockCookies)) {
-                    final URL requestingUrl = webRequest.getRequestingUrl();
-                    if (requestingUrl != null && !isSameSite(requestingUrl, url)) {
+                    // top-level navigations: the initiator decides (Lax);
+                    // other requests: the site for cookies of the initiating document
+                    // (the top-level document if all ancestors are same-site)
+                    URL siteForCookies = webRequest.getRequestingUrl();
+                    if (webRequest.getFetchDestination() != WebRequest.FetchDestination.DOCUMENT
+                            && webRequest.getSiteForCookies() != null) {
+                        siteForCookies = webRequest.getSiteForCookies();
+                    }
+                    if (siteForCookies != null && !HttpClientConverter.isSameSite(siteForCookies, url)) {
                         list.add(new CrossSiteRequestAddCookies(webRequest));
                     }
                     else {
@@ -1277,6 +1276,33 @@ public class HttpWebConnection implements WebConnection {
         @Override
         public void process(final HttpRequest request, final HttpContext context) throws HttpException, IOException {
             request.setHeader(HttpHeader.SEC_FETCH_MODE, value_);
+        }
+    }
+
+    /**
+     * Processes the cookies of a response from an insecure origin; cookies that would overwrite
+     * or shadow a secure cookie are ignored (see {@link HtmlUnitInsecureOriginCookieStore}).
+     */
+    private static final class InsecureOriginResponseProcessCookies implements HttpResponseInterceptor {
+        private final ResponseProcessCookies delegate_ = new ResponseProcessCookies();
+
+        @Override
+        public void process(final HttpResponse response, final HttpContext context)
+                throws HttpException, IOException {
+            final HttpClientContext clientContext = HttpClientContext.adapt(context);
+            final CookieStore cookieStore = clientContext.getCookieStore();
+            if (cookieStore == null) {
+                delegate_.process(response, context);
+                return;
+            }
+
+            clientContext.setCookieStore(new HtmlUnitInsecureOriginCookieStore(cookieStore));
+            try {
+                delegate_.process(response, context);
+            }
+            finally {
+                clientContext.setCookieStore(cookieStore);
+            }
         }
     }
 
